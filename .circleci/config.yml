@@ -1,6 +1,6 @@
 version: 2
 jobs:
-  "driverkit/build/amazonlinux":
+  "drivers/build/amazonlinux":
     docker:
       - image: docker.io/falcosecurity/driverkit:latest
     steps:
@@ -34,7 +34,7 @@ jobs:
           root: driverkit
           paths:
             - output
-  "driverkit/build/amazonlinux2":
+  "drivers/build/amazonlinux2":
     docker:
       - image: docker.io/falcosecurity/driverkit:latest
     steps:
@@ -68,7 +68,7 @@ jobs:
           root: driverkit
           paths:
             - output
-  "driverkit/build/centos":
+  "drivers/build/centos":
     docker:
       - image: docker.io/falcosecurity/driverkit:latest
     steps:
@@ -102,7 +102,7 @@ jobs:
           root: driverkit
           paths:
             - output
-  "driverkit/build/debian":
+  "drivers/build/debian":
     docker:
       - image: docker.io/falcosecurity/driverkit:latest
     steps:
@@ -136,7 +136,7 @@ jobs:
           root: driverkit
           paths:
             - output
-  "driverkit/build/ubuntu-aws":
+  "drivers/build/ubuntu-aws":
     docker:
       - image: docker.io/falcosecurity/driverkit:latest
     steps:
@@ -170,7 +170,7 @@ jobs:
           root: driverkit
           paths:
             - output
-  "driverkit/build/ubuntu-generic":
+  "drivers/build/ubuntu-generic":
     docker:
       - image: docker.io/falcosecurity/driverkit:latest
     steps:
@@ -204,53 +204,137 @@ jobs:
           root: driverkit
           paths:
             - output
-  "driverkit/publish":
+  "drivers/publish":
     docker:
-      - image: docker.bintray.io/jfrog/jfrog-cli-go:latest
+      - image: amazon/aws-cli:latest
     steps:
       - checkout
-      - attach_workspace:
-          at: driverkit
       - run:
           name: Prepare environment
           command: |
-            apk update
-            apk add make git
+            yum update -y
+            yum install tar make git which -y
+      - attach_workspace:
+          at: driverkit
       - run:
-          name: Publish drivers on bintray
+          name: Publish drivers on s3
           command: |
             DRIVERKIT_COMMIT=$(git log -1 --format=format:%H --full-diff -- driverkit/)
             if [ $CIRCLE_SHA1 = $DRIVERKIT_COMMIT ];
             then
               cd driverkit
-              make publish
+              make publish_s3
             fi
+  "drivers/cleanup":
+    docker:
+      - image: amazon/aws-cli:latest
+    steps:
+      - checkout
+      - run:
+          name: Prepare env
+          command: |
+            yum update -y
+            yum install make which -y
+      - run:
+          name: Cleanup
+          command: |
+              cd driverkit
+              make cleanup_s3
+  "test-infra/scan/terraform":
+    docker:
+      - image: alpine:3.12.1
+    steps:
+      - checkout
+      - run:
+          name: Scan terraform code # terrascan -d does not currently support remote TF modules. See: https://github.com/accurics/terrascan/issues/332
+          command: |
+            apk add curl tar
+            curl --location https://github.com/accurics/terrascan/releases/download/v1.1.0/terrascan_1.1.0_Linux_x86_64.tar.gz --output terrascan.tar.gz
+            tar -xvf terrascan.tar.gz
+            install terrascan /usr/local/bin
+            for file in $(ls ./config/clusters/*.tf); do \
+              terrascan scan -t aws -f $file; \
+            done
+  "test-infra/deploy/terraform":
+    requires:
+      - test-infra/scan/terraform
+    docker:
+      - image: amazon/aws-cli:latest
+    steps:
+      - checkout
+      - run:
+          name: Deploy terraform
+          command: |
+            yum update -y
+            yum install jq unzip git -y
+            ./tools/deploy_terraform.sh
+  "test-infra/deploy/prow":
+    requires:
+      - test-infra/deploy/terraform
+    docker:
+      - image: amazon/aws-cli:latest
+    steps:
+      - checkout
+      - run:
+          name: Deploy prow
+          command: |
+            yum update -y
+            yum install jq unzip git wget curl which -y
+            wget "https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl" -O /usr/local/bin/kubectl
+            chmod +x /usr/local/bin/kubectl
+            ./tools/deploy_prow.sh
 workflows:
   version: 2
   build:
     jobs:
-      - "driverkit/build/amazonlinux":
-          context: falco
-      - "driverkit/build/amazonlinux2":
-          context: falco
-      - "driverkit/build/centos":
-          context: falco
-      - "driverkit/build/debian":
-          context: falco
-      - "driverkit/build/ubuntu-aws":
-          context: falco
-      - "driverkit/build/ubuntu-generic":
-          context: falco
-      - "driverkit/publish":
+      - "drivers/build/amazonlinux"
+      - "drivers/build/amazonlinux2"
+      - "drivers/build/centos"
+      - "drivers/build/debian"
+      - "drivers/build/ubuntu-aws"
+      - "drivers/build/ubuntu-generic"
+      - "drivers/publish":
+          context: test-infra
+          filters:
+            branches:
+              only:
+                - master
+          requires:
+            - "drivers/build/amazonlinux"
+            - "drivers/build/amazonlinux2"
+            - "drivers/build/centos"
+            - "drivers/build/debian"
+            - "drivers/build/ubuntu-aws"
+            - "drivers/build/ubuntu-generic"
+      - "drivers/cleanup":
           context: falco
           filters:
             branches:
               only:
                 - master
           requires:
-            - "driverkit/build/amazonlinux"
-            - "driverkit/build/amazonlinux2"
-            - "driverkit/build/centos"
-            - "driverkit/build/debian"
-            - "driverkit/build/ubuntu-aws"
-            - "driverkit/build/ubuntu-generic"
+            - "drivers/publish"
+      - "test-infra/scan/terraform":
+          context: test-infra
+          filters:
+            branches:
+              ignore:
+                - master
+                - /pull\/[0-9]+/ #ignore forked PR's
+      - "test-infra/deploy/terraform":
+          requires:
+            - test-infra/scan/terraform
+          context: test-infra
+          filters:
+            branches:
+              ignore:
+                - master
+                - /pull\/[0-9]+/ #ignore forked PR's
+      - "test-infra/deploy/prow":
+          requires:
+            - test-infra/deploy/terraform
+          context: test-infra
+          filters:
+            branches:
+              ignore:
+                - master
